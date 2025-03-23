@@ -15,13 +15,13 @@ package gsm_test
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/warthog618/modem/at"
