@@ -111,15 +111,12 @@ func New(modem io.ReadWriter, options ...Option) *AT {
 			"E0", // disable echo
 		}
 	}
-	go lineReader(a.modem, a.iLines)
-	go a.indLoop(a.indCh, a.iLines, a.cLines)
-	go cmdLoop(a.cmdCh, a.cLines, a.closed)
+	a.run()
 	return a
 }
 
 const (
 	sub = "\x1a"
-	esc = "\x1b"
 )
 
 // WithEscTime sets the guard time for the modem.
@@ -347,36 +344,22 @@ func (a *AT) SMSCommand(cmd string, sms string, options ...CommandOption) (info 
 	}
 }
 
-// cmdLoop is responsible for the interface to the modem.
-//
-// It serialises the issuing of commands and awaits the responses.
-// If no command is pending then any lines received are discarded.
-//
-// The cmdLoop terminates when the downstream closes.
-func cmdLoop(cmds chan func(), in <-chan string, out chan struct{}) {
-	for {
-		select {
-		case cmd := <-cmds:
-			cmd()
-		case _, ok := <-in:
-			if !ok {
-				close(out)
-				return
-			}
-		}
-	}
+func (a *AT) run() {
+	go a.lineReader(a.modem)
+	go a.indLoop()
+	go a.cmdLoop()
 }
 
 // lineReader takes lines from m and redirects them to out.
 //
 // lineReader exits when m closes.
-func lineReader(m io.Reader, out chan string) {
+func (a *AT) lineReader(m io.Reader) {
 	scanner := bufio.NewScanner(m)
 	scanner.Split(scanLines)
 	for scanner.Scan() {
-		out <- scanner.Text()
+		a.iLines <- scanner.Text()
 	}
-	close(out) // tell pipeline we're done - end of pipeline will close the AT.
+	close(a.iLines) // tell pipeline we're done - end of pipeline will close the AT.
 }
 
 // indLoop is responsible for pulling indications from the stream of lines read
@@ -386,13 +369,13 @@ func lineReader(m io.Reader, out chan string) {
 // assumed to arrive in a contiguous block immediately after the indication.
 //
 // indLoop exits when the in channel closes.
-func (a *AT) indLoop(cmds chan func(), in <-chan string, out chan string) {
-	defer close(out)
+func (a *AT) indLoop() {
+	defer close(a.cLines)
 	for {
 		select {
-		case cmd := <-cmds:
+		case cmd := <-a.indCh:
 			cmd()
-		case line, ok := <-in:
+		case line, ok := <-a.iLines:
 			if !ok {
 				return
 			}
@@ -401,7 +384,7 @@ func (a *AT) indLoop(cmds chan func(), in <-chan string, out chan string) {
 					n := make([]string, ind.lines)
 					n[0] = line
 					for i := 1; i < ind.lines; i++ {
-						t, ok := <-in
+						t, ok := <-a.iLines
 						if !ok {
 							return
 						}
@@ -411,7 +394,27 @@ func (a *AT) indLoop(cmds chan func(), in <-chan string, out chan string) {
 					continue
 				}
 			}
-			out <- line
+			a.cLines <- line
+		}
+	}
+}
+
+// cmdLoop is responsible for the interface to the modem.
+//
+// It serialises the issuing of commands and awaits the responses.
+// If no command is pending then any lines received are discarded.
+//
+// The cmdLoop terminates when the downstream closes.
+func (a *AT) cmdLoop() {
+	for {
+		select {
+		case cmd := <-a.cmdCh:
+			cmd()
+		case _, ok := <-a.cLines:
+			if !ok {
+				close(a.closed)
+				return
+			}
 		}
 	}
 }
@@ -419,20 +422,22 @@ func (a *AT) indLoop(cmds chan func(), in <-chan string, out chan string) {
 // issue an escape command
 //
 // This should only be called from within the cmdLoop.
-func (a *AT) escape(b ...byte) {
-	cmd := append([]byte(esc+"\r\n"), b...)
-	a.modem.Write(cmd)
+func (a *AT) escape(b ...byte) error {
+	_, err := a.modem.Write(append([]byte{27, 13, 10}, b...))
+	if err != nil {
+		return err
+	}
 	a.escGuard = time.NewTimer(a.escTime)
+	return nil
 }
 
-// perform a request  - issuing the command and awaiting the response.
+// perform a request - issuing the command and awaiting the response.
 func (a *AT) processReq(cmd string, timeout time.Duration) (info []string, err error) {
 	a.waitEscGuard()
-	err = a.writeCommand(cmd)
+	err = a.writeCommand(cmd, false)
 	if err != nil {
 		return
 	}
-
 	cmdID := parseCmdID(cmd)
 	var expChan <-chan time.Time
 	if timeout >= 0 {
@@ -472,7 +477,7 @@ func (a *AT) processReq(cmd string, timeout time.Duration) (info []string, err e
 // the data and awaiting the response.
 func (a *AT) processSmsReq(cmd string, sms string, timeout time.Duration) (info []string, err error) {
 	a.waitEscGuard()
-	err = a.writeSMSCommand(cmd)
+	err = a.writeCommand(cmd, true)
 	if err != nil {
 		return
 	}
@@ -487,7 +492,9 @@ func (a *AT) processSmsReq(cmd string, sms string, timeout time.Duration) (info 
 		select {
 		case <-expChan:
 			// cancel outstanding SMS request
-			a.escape()
+			if err = a.escape(); err != nil {
+				return
+			}
 			err = ErrDeadlineExceeded
 			return
 		case line, ok := <-a.cLines:
@@ -514,6 +521,35 @@ func (a *AT) processSmsReq(cmd string, sms string, timeout time.Duration) (info 
 	}
 }
 
+// processSmsRxLine parses a line received from the modem and determines how it
+// adds to the response for the current command.
+//
+// The return values are:
+//   - a line of info to be added to the response (optional)
+//   - a flag indicating if the command is complete.
+//   - an error detected while processing the command.
+func (a *AT) processSmsRxLine(lt rxl, line string, sms string) (info *string, done bool, err error) {
+	switch lt {
+	case rxlUnknown:
+		if strings.HasSuffix(line, sub) && strings.HasPrefix(line, sms) {
+			// swallow echoed SMS PDU
+			return
+		}
+		info = &line
+	case rxlSMSPrompt:
+		if err = a.writeSMS(sms); err != nil {
+			// escape SMS
+			if err2 := a.escape(); err2 != nil {
+				err = errors.Join(err, err2)
+				return
+			}
+		}
+	default:
+		return a.processRxLine(lt, line)
+	}
+	return
+}
+
 // processRxLine parses a line received from the modem and determines how it
 // adds to the response for the current command.
 //
@@ -534,32 +570,6 @@ func (a *AT) processRxLine(lt rxl, line string) (info *string, done bool, err er
 		done = true
 	case rxlConnectError:
 		err = ConnectError(line)
-	}
-	return
-}
-
-// processSmsRxLine parses a line received from the modem and determines how it
-// adds to the response for the current command.
-//
-// The return values are:
-//   - a line of info to be added to the response (optional)
-//   - a flag indicating if the command is complete.
-//   - an error detected while processing the command.
-func (a *AT) processSmsRxLine(lt rxl, line string, sms string) (info *string, done bool, err error) {
-	switch lt {
-	case rxlUnknown:
-		if strings.HasSuffix(line, sub) && strings.HasPrefix(line, sms) {
-			// swallow echoed SMS PDU
-			return
-		}
-		info = &line
-	case rxlSMSPrompt:
-		if err = a.writeSMS(sms); err != nil {
-			// escape SMS
-			a.escape()
-		}
-	default:
-		return a.processRxLine(lt, line)
 	}
 	return
 }
@@ -589,18 +599,13 @@ Loop:
 // writeCommand writes a one line command to the modem.
 //
 // This should only be called from within the cmdLoop.
-func (a *AT) writeCommand(cmd string) error {
-	cmdLine := "AT" + cmd + "\r\n"
-	_, err := a.modem.Write([]byte(cmdLine))
-	return err
-}
-
-// writeSMSCommand writes a the first line of an SMS command to the modem.
-//
-// This should only be called from within the cmdLoop.
-func (a *AT) writeSMSCommand(cmd string) error {
-	cmdLine := "AT" + cmd + "\r"
-	_, err := a.modem.Write([]byte(cmdLine))
+func (a *AT) writeCommand(cmd string, prompt bool) error {
+	var err error
+	if prompt {
+		_, err = fmt.Fprintf(a.modem, "AT%s\r", cmd)
+	} else {
+		_, err = fmt.Fprintf(a.modem, "AT%s\r\n", cmd)
+	}
 	return err
 }
 
@@ -699,17 +704,26 @@ const (
 	rxlConnectError
 )
 
-// Indication represents an unsolicited result code (URC) from the modem, such
-// as a received SMS message.
-//
-// Indications are lines prefixed with a particular pattern, and may include a
-// number of trailing lines. The matching lines are bundled into a slice and
-// sent to the handler.
-type Indication struct {
-	prefix  string
-	lines   int
-	handler InfoHandler
-}
+type (
+	// Indication represents an unsolicited result code (URC) from the modem, such
+	// as a received SMS message.
+	//
+	// Indications are lines prefixed with a particular pattern, and may include a
+	// number of trailing lines. The matching lines are bundled into a slice and
+	// sent to the handler.
+	Indication struct {
+		prefix  string
+		lines   int
+		handler InfoHandler
+	}
+	// IndicationOption alters the behavior of the indication.
+	IndicationOption interface {
+		applyIndicationOption(*Indication)
+	}
+	// TrailingLinesOption specifies the number of trailing lines expected after an
+	// indication line.
+	TrailingLinesOption int
+)
 
 func newIndication(prefix string, handler InfoHandler, options ...IndicationOption) Indication {
 	ind := Indication{
@@ -723,18 +737,8 @@ func newIndication(prefix string, handler InfoHandler, options ...IndicationOpti
 	return ind
 }
 
-// IndicationOption alters the behavior of the indication.
-type IndicationOption interface {
-	applyIndicationOption(*Indication)
-}
-
-// TrailingLinesOption specifies the number of trailing lines expected after an
-// indication line.
-type TrailingLinesOption int
-
 func (o TrailingLinesOption) applyIndicationOption(ind *Indication) {
 	ind.lines = int(o) + 1
-
 }
 
 // WithTrailingLines indicates the number of lines after the line containing
